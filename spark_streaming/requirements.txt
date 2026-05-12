@@ -1,0 +1,5 @@
+pyspark==3.5.0
+delta-spark==3.0.0
+kafka-python==2.0.2
+pytest==7.4.0
+pytest-cov==4.1.0

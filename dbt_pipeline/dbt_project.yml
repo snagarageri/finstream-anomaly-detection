@@ -1,0 +1,37 @@
+name: 'finstream'
+version: '1.0.0'
+config-version: 2
+
+profile: 'finstream'
+
+model-paths: ["models"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  delta_base_path: "/delta"
+  anomaly_threshold: 70
+  suspicious_threshold: 40
+  lookback_days: 30
+
+models:
+  finstream:
+    bronze:
+      +materialized: incremental
+      +incremental_strategy: append
+      +on_schema_change: append_new_columns
+      +tags: ["bronze", "raw"]
+    silver:
+      +materialized: incremental
+      +incremental_strategy: merge
+      +unique_key: transaction_id
+      +on_schema_change: append_new_columns
+      +tags: ["silver", "cleaned"]
+    gold:
+      +materialized: table
+      +tags: ["gold", "analytics"]

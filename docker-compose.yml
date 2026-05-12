@@ -1,0 +1,202 @@
+version: '3.8'
+
+networks:
+  finstream:
+    driver: bridge
+
+volumes:
+  delta_storage:
+  postgres_data:
+  grafana_data:
+  airflow_logs:
+
+services:
+
+  # ─── KAFKA INFRASTRUCTURE ────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: finstream-zookeeper
+    networks: [finstream]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: echo srvr | nc localhost 2181 | grep Mode
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: finstream-kafka
+    networks: [finstream]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 168      # 7 days
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824 # 1 GB
+    healthcheck:
+      test: kafka-topics --bootstrap-server localhost:9092 --list
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: finstream-kafka-init
+    networks: [finstream]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic raw-transactions --partitions 3 --replication-factor 1 \
+          --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic anomaly-alerts --partitions 1 --replication-factor 1
+        echo "Kafka topics created."
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: finstream-kafka-ui
+    networks: [finstream]
+    depends_on: [kafka]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: finstream
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ─── TRANSACTION PRODUCER ────────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: finstream-producer
+    networks: [finstream]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: raw-transactions
+      TRANSACTIONS_PER_SECOND: ${TRANSACTIONS_PER_SECOND:-500}
+      ANOMALY_INJECTION_RATE: ${ANOMALY_INJECTION_RATE:-0.05}  # 5% anomalies
+      NUM_USERS: 1000
+      NUM_MERCHANTS: 500
+    restart: on-failure
+
+  # ─── SPARK STREAMING ─────────────────────────────────────────────────────
+  spark:
+    build:
+      context: ./spark_streaming
+      dockerfile: Dockerfile
+    container_name: finstream-spark
+    networks: [finstream]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "4040:4040"   # Spark UI
+    volumes:
+      - delta_storage:/delta
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: raw-transactions
+      DELTA_PATH: /delta
+      CHECKPOINT_PATH: /delta/checkpoints
+      ALERT_TOPIC: anomaly-alerts
+      SPARK_MASTER: local[4]
+      BATCH_INTERVAL_SECONDS: 30
+    restart: on-failure
+
+  # ─── POSTGRESQL (dbt target + Airflow metadata) ──────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: finstream-postgres
+    networks: [finstream]
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-finstream}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finstream123}
+      POSTGRES_DB: finstream
+    healthcheck:
+      test: pg_isready -U finstream
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── DBT ─────────────────────────────────────────────────────────────────
+  dbt:
+    image: ghcr.io/dbt-labs/dbt-duckdb:1.7.0
+    container_name: finstream-dbt
+    networks: [finstream]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./dbt_pipeline:/usr/app/dbt
+      - delta_storage:/delta
+    working_dir: /usr/app/dbt
+    command: run --profiles-dir . --project-dir .
+    environment:
+      DELTA_PATH: /delta
+
+  # ─── APACHE AIRFLOW ──────────────────────────────────────────────────────
+  airflow:
+    image: apache/airflow:2.8.0
+    container_name: finstream-airflow
+    networks: [finstream]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://finstream:finstream123@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=}
+      AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: UTC
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: finstream
+    command: standalone
+
+  # ─── GRAFANA ─────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: finstream-grafana
+    networks: [finstream]
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: finstream
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/transactions.json
+    depends_on: [postgres]

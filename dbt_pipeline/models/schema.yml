@@ -1,0 +1,128 @@
+version: 2
+
+# ─── SOURCES ──────────────────────────────────────────────────────────────────
+sources:
+  - name: delta_lake
+    description: "Delta Lake storage — written by PySpark Structured Streaming"
+    tables:
+      - name: bronze_raw
+        description: "Raw transaction records from Kafka via PySpark"
+        meta:
+          layer: bronze
+
+# ─── MODELS ───────────────────────────────────────────────────────────────────
+models:
+
+  # ── Bronze ──────────────────────────────────────────────────────────────────
+  - name: bronze_transactions
+    description: >
+      Raw, immutable transaction records ingested from Delta Lake bronze path.
+      Append-only. No transformations applied. Complete audit trail from source.
+    columns:
+      - name: transaction_id
+        description: "Unique transaction identifier"
+        tests:
+          - not_null
+          - unique
+      - name: card_id
+        description: "Card identifier"
+        tests:
+          - not_null
+      - name: amount
+        description: "Transaction amount in source currency"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0.01
+              max_value: 1000000
+      - name: currency
+        description: "ISO 4217 currency code"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['USD', 'EUR', 'GBP', 'CAD', 'JPY', 'AUD']
+
+  # ── Silver ──────────────────────────────────────────────────────────────────
+  - name: silver_transactions
+    description: >
+      Cleaned, deduplicated, and enriched transaction records.
+      Business logic applied. Suitable for analytics and ML feature stores.
+    columns:
+      - name: transaction_id
+        description: "Unique transaction identifier"
+        tests:
+          - not_null
+          - unique
+      - name: card_id
+        tests:
+          - not_null
+      - name: user_id
+        tests:
+          - not_null
+      - name: amount
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0.01
+              max_value: 100000
+      - name: currency
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['USD', 'EUR', 'GBP', 'CAD', 'JPY', 'AUD']
+      - name: amount_bucket
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['MICRO', 'SMALL', 'MEDIUM', 'LARGE', 'VERY_LARGE']
+      - name: tx_hour
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 23
+      - name: is_high_risk_mcc
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+      - name: event_timestamp
+        tests:
+          - not_null
+
+  # ── Gold ────────────────────────────────────────────────────────────────────
+  - name: gold_anomalies
+    description: >
+      Business-ready anomaly records with composite risk scores.
+      Powers the Grafana real-time dashboard, executive fraud reporting,
+      and downstream case management systems.
+      Contains only MEDIUM and HIGH risk transactions.
+    columns:
+      - name: transaction_id
+        tests:
+          - not_null
+          - unique
+      - name: anomaly_score
+        description: "Composite anomaly score (0–100). Higher = more suspicious."
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 100
+      - name: risk_level
+        description: "Categorical risk classification"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['LOW', 'MEDIUM', 'HIGH']
+      - name: risk_label
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['🚨 ANOMALY', '⚠️  SUSPICIOUS', '✅ NORMAL']
+      - name: end_to_end_latency_ms
+        description: "Total pipeline latency from event to score (milliseconds)"
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 60000   # alert if > 60 seconds
