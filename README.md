@@ -302,6 +302,9 @@ models:
 
 ---
 
+<img width="1440" height="900" alt="Screenshot 2026-05-12 at 7 16 39 PM" src="https://github.com/user-attachments/assets/6b9fc748-26e6-4fe6-a56d-38daaa09bea2" />
+
+
 ## 📈 Grafana Dashboard Panels
 
 1. **Live Transaction Feed** — Real-time table of last 100 transactions
